@@ -1,0 +1,7 @@
+playwright
+langchain
+langchain-anthropic
+langgraph
+anthropic
+python-dotenv
+markdownify
