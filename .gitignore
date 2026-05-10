@@ -5,3 +5,8 @@ __pycache__/
 .venv/
 venv/
 .claude/settings.local.json
+
+# mcp-server
+mcp-server/node_modules/
+mcp-server/dist/
+mcp-server/.env

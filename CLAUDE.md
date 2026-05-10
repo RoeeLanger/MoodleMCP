@@ -2,78 +2,123 @@
 
 ## What This Is
 
-A read-only LLM-powered school assistant that scrapes a university Moodle instance via Playwright and answers natural-language questions about course activity, upcoming deadlines, forum posts, and calendar events.
+A local MCP (Model Context Protocol) server that scrapes a student's Moodle instance and exposes course data to any MCP-compatible LLM client (Claude Desktop, Cursor, etc.) via structured tools.
 
-Target audience: personal use and/or small distribution to classmates (~100 users max).
-
----
-
-## Core Architecture
-
-**Stateless RAG loop over live-scraped pages.**
-
-User sends a query → ReAct agent selects Playwright tools → pages are scraped and converted to Markdown → LLM interprets content and returns a structured answer.
-
-No persistent database. "New" content is defined by a time window (default: last 7 days), not by change-tracking.
+Runs entirely on the student's machine — no central hosting, no credential exposure.
 
 ---
 
-## Key Design Decisions
+## Architecture
 
-### Scraping: Playwright, not Moodle REST API
-The university likely does not expose the Moodle Web Services API to students. Playwright is the primary data source. If the API turns out to be available, it should replace Playwright where possible — worth checking via "Security keys" in Moodle profile settings.
+```
+Claude Desktop / Cursor / any MCP client
+        │  stdio transport
+        ▼
+mcp-server/          ← TypeScript, npm package
+        │
+        ▼
+~/.moodle-mcp/
+  ├── db.sqlite            ← courses, assignments, events (SQLite + FTS5)
+  ├── storage_state.json   ← Playwright session cookies
+  └── files/               ← downloaded course files (Step 3+)
+        │
+        │ Playwright (headless Chromium)
+        ▼
+  University's Moodle server
+```
 
-### HTML Extraction Pipeline
-Playwright fetches the page → strip to Markdown using `markdownify` or `html2text` → pass Markdown to LLM. Raw HTML is too noisy and token-heavy. Moodle pages render cleanly enough as Markdown for the LLM to interpret, including messy or inconsistent course/file naming schemes.
-
-### Session Management
-Use Playwright's `storage_state` (cookies + localStorage) saved to a local JSON file. Load it on startup; re-run the login flow if the session is expired. Credentials are stored in a `.env` file loaded via `python-dotenv`.
-
-### Startup Cache (In-Memory)
-On startup, scrape two pages and cache results in memory for the session:
-1. Dashboard → course list `{course_name: url}`
-2. Calendar → upcoming events (~2 weeks out)
-
-This avoids re-navigating the dashboard on every tool call. All other data (forums, assignments, files) is fetched on demand. Provide a `--no-preload` flag to skip for single fast queries.
-
-### Agent: ReAct for Now, LangGraph-Ready
-Use a simple ReAct agent (LangChain) for the initial build — the toolset is small and queries are mostly single-step. Structure the code so a LangGraph "morning briefing" flow (login → check all courses → summarize new activity) can be added later without rewriting the tool layer.
-
-### Tool Set
-| Tool | Description |
-|------|-------------|
-| `list_courses()` | Returns from startup cache |
-| `get_calendar(days=7)` | Returns from startup cache |
-| `get_course_content(course)` | Scrapes main course page, sections + files |
-| `get_forum_recent(course, days=7)` | Scrapes forum for recent posts |
-| `get_assignments(course)` | Scrapes assignment list with due dates |
-
-### What's Explicitly Out of Scope (for now)
-- Any write/submit actions on Moodle (no form fills, no exam interaction)
-- Course material ingestion / vector DB / RAG over files — deferred as a separate feature
-- Persistent change-tracking database
-
----
-
-## Interface (TBD)
-- **Personal / GitHub shelf**: CLI entry point
-- **Distribution to classmates**: Telegram bot wrapping the same core layer (FastAPI backend)
-
-Build CLI first. Design the core scraping/LLM layer to be interface-agnostic so the bot wrapper can be added without touching internals.
+**Staleness rule:** every tool call checks `last_scraped` in the courses table.
+If missing or older than 24 h, the scraper runs automatically before returning data.
 
 ---
 
 ## Stack
-- **Scraping**: `playwright` (async)
-- **HTML → Markdown**: `markdownify` or `html2text`
-- **Orchestration**: `langchain` / `langgraph`
-- **LLM**: Claude (via Anthropic SDK) — default to latest Sonnet
-- **Auth / config**: `python-dotenv` + `.env`
-- **Session persistence**: Playwright `storage_state` JSON file
+
+| Layer | Technology |
+|---|---|
+| MCP server | `@modelcontextprotocol/sdk` (TypeScript, stdio) |
+| Scraper | `playwright` (headless Chromium) |
+| Database | `better-sqlite3` (SQLite WAL) |
+| PDF extraction | `pdf-parse` (Step 3) |
+| DOCX/PPTX | `mammoth` / `officeparser` (Step 4) |
+| Auth / config | `dotenv` + `.env` or MCP client `env` block |
+
+---
+
+## MCP Tools (current — Steps 1+2)
+
+| Tool | Description |
+|---|---|
+| `get_courses()` | Lists all enrolled courses with IDs and URLs |
+| `get_assignments(course_id?, days?)` | Assignments from DB, with ISO due dates |
+| `get_events(days?)` | Calendar events (includes assignment deadlines) |
+| `force_refresh()` | Bypass 24 h cache and re-scrape immediately |
+
+---
+
+## Scraper Pipeline (Steps 1–2)
+
+1. Load Playwright session from `~/.moodle-mcp/storage_state.json`; re-login if expired
+2. Dashboard (`/my/`) → enumerate enrolled courses → upsert `courses` table
+3. Calendar upcoming (`/calendar/view.php?view=upcoming`) → upsert `events` table;
+   events linking to `mod/assign` are also written to `assignments` table
+
+---
+
+## Build Order
+
+```
+Step 1+2 ✓  Scraper + SQLite + 4 MCP tools
+Step 3      File downloader + PDF text extraction
+Step 4      PPTX + DOCX extraction
+Step 5      SQLite FTS5 search_materials tool
+Step 6      npx init CLI + npm packaging
+```
+
+---
+
+## Repo Layout
+
+```
+mcp-server/
+├── package.json
+├── tsconfig.json
+├── .env.example        ← copy to .env and fill in credentials
+└── src/
+    ├── index.ts        ← MCP server entry point + tool registration
+    ├── db.ts           ← SQLite schema + typed query helpers
+    ├── scraper.ts      ← Playwright login / courses / calendar
+    ├── config.ts       ← env vars + ~/.moodle-mcp/ paths
+    └── dump.ts         ← dev script: scrape and print DB contents
+```
 
 ---
 
 ## Repo Conventions
-- `.env` holds credentials — never commit it, keep a `.env.example`
-- `storage_state.json` holds browser session — never commit it
-- Both must be in `.gitignore` from day one
+
+- `mcp-server/.env` holds credentials — never commit, keep `.env.example`
+- `~/.moodle-mcp/storage_state.json` holds the browser session — never commit
+- Both are in `.gitignore`
+- All logging uses `console.error` (stdout is reserved for the MCP stdio protocol)
+
+---
+
+## Wiring into Claude Desktop
+
+Add to `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "moodle": {
+      "command": "node",
+      "args": ["C:\\path\\to\\MoodleAgent\\mcp-server\\dist\\index.js"],
+      "env": {
+        "MOODLE_URL": "https://moodle.bgu.ac.il/moodle/",
+        "MOODLE_USERNAME": "your_username",
+        "MOODLE_PASSWORD": "your_password"
+      }
+    }
+  }
+}
+```
