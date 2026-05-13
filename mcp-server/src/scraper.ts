@@ -15,9 +15,11 @@ import {
   STORAGE_STATE_PATH,
 } from './config.js';
 import {
+  deleteCalendarEvents,
   deleteSectionsAndActivities,
   getCourses,
   upsertActivity,
+  upsertCalendarEvent,
   upsertCourse,
   upsertSection,
   type Course,
@@ -82,12 +84,16 @@ async function scrapeCourses(context: BrowserContext): Promise<Course[]> {
   try {
     await page.goto(MOODLE_URL + 'my/', { waitUntil: 'networkidle' });
 
-    // Strategy 1: course-listitem cards (BGU's custom dashboard layout)
+    // Strategy 1: course-listitem cards — try known link selectors within each card
     const items = page.locator('li.course-listitem');
     if (await items.count()) {
       console.error(`  Using li.course-listitem (${await items.count()} items)`);
       for (let i = 0; i < (await items.count()); i++) {
-        const link = items.nth(i).locator('a.aalinkcoursename').first();
+        const item = items.nth(i);
+        // Try named classes first, then any course-view anchor inside the card
+        const link = (await item.locator('a.aalink.coursename').count())
+          ? item.locator('a.aalink.coursename').first()
+          : item.locator('a[href*="/course/view.php"]').first();
         if (!(await link.count())) continue;
         const name = (await link.innerText()).trim();
         const href = await link.getAttribute('href');
@@ -96,9 +102,11 @@ async function scrapeCourses(context: BrowserContext): Promise<Course[]> {
         upsertCourse(id, name, href);
         courses.push({ id, name, url: href, last_scraped: Math.floor(Date.now() / 1000) });
       }
-    } else {
-      // Strategy 2: generic fallback — any anchor linking to a course view page
-      console.error('  li.course-listitem matched 0 — falling back to a[href*="/course/view.php"]');
+    }
+
+    // Strategy 2: generic fallback — any course-view anchor on the page
+    if (courses.length === 0) {
+      console.error('  li.course-listitem yielded 0 — falling back to a[href*="/course/view.php"]');
       const anchors = await page.$$('a[href*="/course/view.php"]');
       const seen = new Set<string>();
       for (const anchor of anchors) {
@@ -198,6 +206,71 @@ async function scrapeCourseContent(context: BrowserContext, course: Course): Pro
   }
 }
 
+// ── Calendar ──────────────────────────────────────────────────────────────────
+
+async function scrapeCalendar(context: BrowserContext): Promise<void> {
+  console.error('Scraping upcoming calendar events...');
+  const page = await context.newPage();
+
+  try {
+    await page.goto(MOODLE_URL + 'calendar/view.php?view=upcoming', { waitUntil: 'networkidle' });
+
+    deleteCalendarEvents();
+
+    const eventList = page.locator('.eventlist.my-1');
+    if (!(await eventList.count())) {
+      console.error('  No .eventlist.my-1 found — calendar may be empty or layout changed');
+      return;
+    }
+
+    const events = eventList.locator('[data-type="event"]');
+    const count = await events.count();
+    console.error(`  Found ${count} upcoming events`);
+
+    for (let i = 0; i < count; i++) {
+      const event = events.nth(i);
+
+      // Title — second .d-inline-block holds the h3.name; first is the icon
+      const name = await visibleText('h3.name', event);
+      if (!name) continue;
+
+      // URL — submission link in the card footer
+      const footerLink = event.locator('.card-footer a').first();
+      const url = (await footerLink.count()) ? await footerLink.getAttribute('href') : null;
+
+      const desc = event.locator('.description.card-body').first();
+
+      // Course name — anchor linking to /course/view.php (not the date link)
+      const courseLink = desc.locator('a[href*="/course/view.php"]').first();
+      const course_name = (await courseLink.count())
+        ? (await courseLink.innerText()).trim()
+        : '';
+
+      // Due date — extract Unix timestamp from the day-view calendar link,
+      // then pull the clock time (e.g. "23:59") from the same cell's text
+      const dateLink = desc.locator('a[href*="calendar/view.php?view=day"]').first();
+      let due_iso: string | null = null;
+      if (await dateLink.count()) {
+        const href = await dateLink.getAttribute('href');
+        const ts = href?.match(/[?&]time=(\d+)/)?.[1];
+        if (ts) {
+          const dateStr = new Date(parseInt(ts) * 1000).toISOString().split('T')[0];
+          const cellText = await dateLink.locator('xpath=..').innerText();
+          const timeMatch = cellText.match(/\d{1,2}:\d{2}/);
+          due_iso = timeMatch ? `${dateStr}T${timeMatch[0]}` : dateStr;
+        }
+      }
+
+      const id = url?.match(/[?&]id=(\d+)/)?.[1] ?? hashId(name + course_name);
+      upsertCalendarEvent({ id, name, course_name, due_iso, url: url ?? null });
+    }
+
+    console.error('  Calendar scrape complete.');
+  } finally {
+    await page.close();
+  }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 export async function runScraper(): Promise<void> {
@@ -228,6 +301,8 @@ export async function runScraper(): Promise<void> {
     for (const course of courses) {
       await scrapeCourseContent(context, course);
     }
+
+    await scrapeCalendar(context);
 
     await context.storageState({ path: STORAGE_STATE_PATH });
     console.error('Scrape complete.');

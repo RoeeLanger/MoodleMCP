@@ -2,7 +2,7 @@
 // Run after build: node dist/dump.js
 // Always does a fresh scrape so you see the current state of the DB.
 import { runScraper } from './scraper.js';
-import { getCourses, getCourseContent } from './db.js';
+import { getCalendarEvents, getCourseContent, getCourses } from './db.js';
 
 console.log('Running scraper...\n');
 await runScraper();
@@ -32,4 +32,15 @@ for (const course of courses) {
       console.log(`      • ${act.name}${type}`);
     }
   }
+}
+
+const events = getCalendarEvents();
+console.log(`\n=== UPCOMING CALENDAR EVENTS (${events.length}) ===`);
+if (events.length === 0) {
+  console.log('  (none)');
+}
+for (const ev of events) {
+  const due = ev.due_iso ?? 'no due date';
+  console.log(`  • [${due}]  ${ev.name}  —  ${ev.course_name}`);
+  if (ev.url) console.log(`      ${ev.url}`);
 }

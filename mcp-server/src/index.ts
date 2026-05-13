@@ -17,7 +17,7 @@ import { z } from 'zod';
 import { STALE_HOURS } from './config.js';
 import {
   findCourseByNameOrId,
-  getAssignments,
+  getCalendarEvents,
   getCourseContent,
   getCourses,
   getLastScrapeTime,
@@ -83,30 +83,19 @@ server.tool(
 
 server.tool(
   'get_assignments',
-  'Returns all assignment activities across every course, optionally filtered to one course. ' +
-  'Each result includes the course name and the section it lives in.',
+  'Returns upcoming assignments from the Moodle calendar with due dates and course names. ' +
+  'Results are ordered by due date ascending. Optionally filter to one course by partial name.',
   {
     course: z
       .string()
       .optional()
-      .describe('Course ID or partial name to filter by; omit to return assignments from all courses'),
+      .describe('Partial course name to filter by (e.g. "אוטומציה"); omit to return all upcoming assignments'),
   },
   async ({ course }) => {
     await ensureFreshData();
-
-    let courseId: string | undefined;
-    if (course) {
-      const found = findCourseByNameOrId(course);
-      if (!found) {
-        return {
-          content: [{ type: 'text', text: `No course found matching "${course}". Try get_courses to see available courses.` }],
-        };
-      }
-      courseId = found.id;
-    }
-
+    const events = getCalendarEvents(course);
     return {
-      content: [{ type: 'text', text: JSON.stringify(getAssignments(courseId), null, 2) }],
+      content: [{ type: 'text', text: JSON.stringify(events, null, 2) }],
     };
   }
 );

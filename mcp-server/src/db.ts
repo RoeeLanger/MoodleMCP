@@ -3,6 +3,7 @@
  *
  * Schema overview:
  *   courses   → sections   → activities
+ *   calendar_events (scraped from /calendar/view.php?view=upcoming)
  *
  * All write operations use INSERT … ON CONFLICT DO UPDATE so the scraper can
  * safely re-run without duplicating data.
@@ -37,6 +38,14 @@ db.exec(`
     type       TEXT,
     url        TEXT,
     position   INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS calendar_events (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    course_name TEXT NOT NULL,
+    due_iso     TEXT,
+    url         TEXT
   );
 `);
 
@@ -74,6 +83,14 @@ export interface CourseContent {
 export interface AssignmentRow extends Activity {
   course_name: string;
   section_name: string;
+}
+
+export interface CalendarEvent {
+  id: string;
+  name: string;
+  course_name: string;
+  due_iso: string | null;
+  url: string | null;
 }
 
 // ── Reads ─────────────────────────────────────────────────────────────────────
@@ -141,6 +158,21 @@ export function getLastScrapeTime(): number | null {
   return row?.last ?? null;
 }
 
+export function getCalendarEvents(courseSubstring?: string): CalendarEvent[] {
+  if (courseSubstring) {
+    return db
+      .prepare(
+        `SELECT * FROM calendar_events
+         WHERE course_name LIKE ?
+         ORDER BY due_iso ASC, name`
+      )
+      .all(`%${courseSubstring}%`) as CalendarEvent[];
+  }
+  return db
+    .prepare('SELECT * FROM calendar_events ORDER BY due_iso ASC, name')
+    .all() as CalendarEvent[];
+}
+
 // ── Writes ────────────────────────────────────────────────────────────────────
 
 export function upsertCourse(id: string, name: string, url: string): void {
@@ -181,6 +213,22 @@ export function upsertActivity(a: Activity): void {
 export function deleteSectionsAndActivities(courseId: string): void {
   db.prepare('DELETE FROM activities WHERE course_id = ?').run(courseId);
   db.prepare('DELETE FROM sections   WHERE course_id = ?').run(courseId);
+}
+
+export function upsertCalendarEvent(e: CalendarEvent): void {
+  db.prepare(
+    `INSERT INTO calendar_events (id, name, course_name, due_iso, url)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name        = excluded.name,
+       course_name = excluded.course_name,
+       due_iso     = excluded.due_iso,
+       url         = excluded.url`
+  ).run(e.id, e.name, e.course_name, e.due_iso, e.url);
+}
+
+export function deleteCalendarEvents(): void {
+  db.prepare('DELETE FROM calendar_events').run();
 }
 
 export default db;
